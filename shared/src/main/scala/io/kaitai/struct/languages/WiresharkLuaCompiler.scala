@@ -63,21 +63,36 @@ class WiresharkLuaCompiler(typeProvider: ClassTypeProvider, config: RuntimeConfi
     params.foreach((p) => handleAssignmentSimple(p.id, paramName(p.id)))
   }
 
+  // Maps a Kaitai DataType onto a Wireshark ftypes.* constant. Width-aware
+  // (a `b11` field is a UINT16, not a blanket BYTES/UINT32), and unwraps
+  // EnumType down to its underlying int type: for an attribute with `enum:`
+  // set, dataType *is* EnumType(name, basedOn) - see AttrSpec/DataType.fromYaml
+  // - so without unwrapping it here, every enum field fell through to the
+  // catch-all "BYTES" case below.
   def attr2wireshark(attrType: DataType): String =
     attrType match {
       case _:BytesLimitType => "BYTES"
       case Int1Type(false) => "UINT8"
       case Int1Type(true) => "INT8"
-      case IntMultiType(true, _, _) => "INT32"
-      case IntMultiType(false, _, _) => "UINT32"
-      case BitsType1(_) => "UINT8"
-      // FIXME: is this how they work?
-      case BitsType(_, _) => "BYTES"
-      case FloatMultiType(_, _) => "FLOAT"
+      case IntMultiType(signed, width, _) =>
+        // width was previously ignored here, so every multi-byte int (u2/u4/u8...)
+        // was mis-reported as a 32-bit field regardless of its real size.
+        val prefix = if (signed) "INT" else "UINT"
+        s"$prefix${width.width * 8}"
+      case BitsType1(_) => "BOOLEAN"
+      case BitsType(width, _) =>
+        // bucket by bit width into the smallest ftype that holds it, instead of
+        // always falling back to BYTES (which made tree:add reject a plain number).
+        if (width <= 8) "UINT8"
+        else if (width <= 16) "UINT16"
+        else if (width <= 32) "UINT32"
+        else "UINT64"
+      case FloatMultiType(width, _) =>
+        if (width.width == 8) "DOUBLE" else "FLOAT"
       case _:StrType => "STRINGZ"
+      case EnumType(_, basedOn) => attr2wireshark(basedOn)
       case _ => "BYTES"
     }
-
 
   override def attrUserTypeParse(id: Identifier, dataType: UserType, io: String, rep: RepeatSpec, defEndian: Option[FixedEndian], assignType: DataType): Unit = {
     var tvbCalcSize = true
@@ -106,7 +121,27 @@ class WiresharkLuaCompiler(typeProvider: ClassTypeProvider, config: RuntimeConfi
     s"${prefix}_${publicMemberName(id)}"
   }
 
+  // attrParse (CommonReads.scala) calls attrDebugStart(id, attr.dataType, ...)
+  // *before* dispatching into attrParse2/parseExpr. For an attribute with
+  // `enum:` set, attr.dataType is EnumType(name, basedOn) - the enum wrapper
+  // itself, not the underlying int type - and attrParse2's `case t: EnumType`
+  // branch then calls parseExpr(t.basedOn, ...) to do the actual read, then
+  // wraps the result via translator.doEnumById(...) before assignment. So by
+  // the time handleAssignmentSimple runs, self.<field> holds an enum-wrapped
+  // Lua value, not a plain number - useless for Wireshark's tree:add, which
+  // needs a number matching the field's ftype.
+  //
+  // We track which attribute (if any) currently being read is enum-typed, so
+  // parseExpr can stash the *raw* read result in a `_raw_<name>` local before
+  // it gets wrapped, and attrDebugEnd can hand that raw local to Wireshark
+  // instead of the enum object.
+  private var curEnumAttrId: Option[Identifier] = None
+
   override def attrDebugStart(attrId: Identifier, attrType: DataType, io: Option[String], rep: RepeatSpec): Unit = {
+    curEnumAttrId = attrType match {
+      case EnumType(_, _) => Some(attrId)
+      case _ => None
+    }
     io match {
       case Some(ioStr) => out.puts(s"local _offset = $ioStr:pos()")
       case None => // value instance (computed, not parsed from a stream) - nothing to snapshot
@@ -124,40 +159,74 @@ class WiresharkLuaCompiler(typeProvider: ClassTypeProvider, config: RuntimeConfi
         // FIXME: hack
         importList.add(s"local $varName = ProtoField.new('$shortName', '$dotName', ftypes.$spec)")
         importList.add(s"table.insert($protoName.fields, $varName)")
-        out.puts(s"self._tree:add($varName, $io._io.tvb(_offset, $io:pos() - _offset), ${privateMemberName(attrName)})")
+
+        // For enum fields self.<n> holds the enum-wrapped value, not a plain
+        // number - use the raw value stashed by parseExpr() instead.
+        val valueSrc = attrType match {
+          case EnumType(_, _) => s"_raw_${idToStr(attrName)}"
+          case _ => privateMemberName(attrName)
+        }
+        // Lua numbers can't carry full 64-bit precision; Wireshark's tree:add
+        // needs its UInt64/Int64 userdata for ftypes.UINT64/INT64 values.
+        val valueExpr = spec match {
+          case "UINT64" => s"UInt64($valueSrc)"
+          case "INT64" => s"Int64($valueSrc)"
+          case _ => valueSrc
+        }
+        out.puts(s"self._tree:add($varName, $io._io.tvb(_offset, $io:pos() - _offset), $valueExpr)")
     }
   }
 
-  override def parseExpr(dataType: DataType, assignType: DataType, io: String, defEndian: Option[FixedEndian]): String = dataType match {
-    case t: ReadableType =>
-      s"$io:read_${t.apiCall(defEndian)}()"
-    case blt: BytesLimitType =>
-      s"$io:read_bytes(${expression(blt.size)})"
-    case _: BytesEosType =>
-      s"$io:read_bytes_full()"
-    case BytesTerminatedType(terminator, include, consume, eosError, _) =>
-      s"$io:read_bytes_term($terminator, $include, $consume, $eosError)"
-    case BitsType1(bitEndian) =>
-      s"$io:read_bits_int_${bitEndian.toSuffix}(1) ~= 0"
-    case BitsType(width: Int, bitEndian) =>
-      s"$io:read_bits_int_${bitEndian.toSuffix}($width)"
-    case t: UserType =>
-      val addParams = Utils.join(t.args.map((a) => translator.translate(a)), "", ", ", ", ")
-      val addArgs = if (t.isOpaque) {
-        ""
-      } else {
-        val parent = t.forcedParent match {
-          case Some(USER_TYPE_NO_PARENT) => "nil"
-          case Some(fp) => translator.translate(fp)
-          case None => "self"
+  override def parseExpr(dataType: DataType, assignType: DataType, io: String, defEndian: Option[FixedEndian]): String = {
+    val raw = dataType match {
+      case t: ReadableType =>
+        s"$io:read_${t.apiCall(defEndian)}()"
+      case blt: BytesLimitType =>
+        s"$io:read_bytes(${expression(blt.size)})"
+      case _: BytesEosType =>
+        s"$io:read_bytes_full()"
+      case BytesTerminatedType(terminator, include, consume, eosError, _) =>
+        s"$io:read_bytes_term($terminator, $include, $consume, $eosError)"
+      case BitsType1(bitEndian) =>
+        s"$io:read_bits_int_${bitEndian.toSuffix}(1) ~= 0"
+      case BitsType(width: Int, bitEndian) =>
+        s"$io:read_bits_int_${bitEndian.toSuffix}($width)"
+      case t: UserType =>
+        val addParams = Utils.join(t.args.map((a) => translator.translate(a)), "", ", ", ", ")
+        val addArgs = if (t.isOpaque) {
+          ""
+        } else {
+          val parent = t.forcedParent match {
+            case Some(USER_TYPE_NO_PARENT) => "nil"
+            case Some(fp) => translator.translate(fp)
+            case None => "self"
+          }
+          val addEndian = t.classSpec.get.meta.endian match {
+            case Some(InheritedEndian) => ", self._is_le"
+            case _ => ""
+          }
+          s", _tree, $parent, self._root$addEndian"
         }
-        val addEndian = t.classSpec.get.meta.endian match {
-          case Some(InheritedEndian) => ", self._is_le"
-          case _ => ""
-        }
-        s", _tree, $parent, self._root$addEndian"
-      }
-      s"${types2class(t.classSpec.get.name)}($addParams$io$addArgs)"
+        s"${types2class(t.classSpec.get.name)}($addParams$io$addArgs)"
+    }
+
+    // If attrDebugStart just told us this read belongs to an enum-typed
+    // attribute, capture the raw value in a named local instead of returning
+    // the read expression directly. Whatever wraps our return value in an
+    // enum lookup (translator.doEnumById) will then wrap the local's name
+    // instead of the raw read call, e.g.:
+    //   local _raw_subtype = self._io:read_u1()
+    //   self.subtype = Ieee1722Simple1.SubtypeEnum(_raw_subtype)
+    // ...leaving `_raw_subtype` available for attrDebugEnd to hand to Wireshark.
+    curEnumAttrId match {
+      case Some(attrId) =>
+        curEnumAttrId = None
+        val rawVar = s"_raw_${idToStr(attrId)}"
+        out.puts(s"local $rawVar = $raw")
+        rawVar
+      case None =>
+        raw
+    }
   }
 
   override def allocateIO(varName: Identifier, rep: RepeatSpec): String = {
