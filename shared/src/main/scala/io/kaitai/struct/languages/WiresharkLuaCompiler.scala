@@ -109,6 +109,7 @@ class WiresharkLuaCompiler(typeProvider: ClassTypeProvider, config: RuntimeConfi
   override def attrDebugStart(attrId: Identifier, attrType: DataType, io: Option[String], rep: RepeatSpec): Unit = {
     io match {
       case Some(ioStr) => out.puts(s"local _offset = $ioStr:pos()")
+      case None => // value instance (computed, not parsed from a stream) - nothing to snapshot
     }
   }
 
