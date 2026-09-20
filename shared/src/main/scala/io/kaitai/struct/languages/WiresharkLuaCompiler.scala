@@ -21,7 +21,7 @@ class WiresharkLuaCompiler(typeProvider: ClassTypeProvider, config: RuntimeConfi
     outHeader.puts("-- This file is compatible with Lua 5.3")
     outHeader.puts
 
-    importList.add("package.prepend_path(\"plugins/kaitai_struct_lua_runtime\")")
+    //importList.add("package.prepend_path(\"plugins/kaitai_struct_lua_runtime\")")
     importList.add("local class = require(\"class\")")
     importList.add("require(\"tvbstream\")")
     importList.add("require(\"kaitaistruct\")")
@@ -156,8 +156,23 @@ class WiresharkLuaCompiler(typeProvider: ClassTypeProvider, config: RuntimeConfi
         val varName = protoFieldName(attrName)
         val shortName = idToStr(attrName)
         val dotName = typeProvider.nowClass.name.map(x => type2class(x)).mkString(".") + "." + publicMemberName(attrName)
+
+        // For enum fields, build a Wireshark "valuestring" table (raw id -> symbolic
+        // name) so the packet tree shows e.g. "(destination_unreachable) 3" instead of just "3". Enum
+        // member names are validated KS identifiers, so no quoting/escaping needed.
+        val enumSpecOpt = attrType match {
+          case et: EnumType => et.enumSpec
+          case _ => None
+        }
+        val protoFieldArgs = enumSpecOpt match {
+          case Some(es) =>
+            val entries = es.sortedSeq.map { case (id, v) => s"[$id] = '${v.name}'" }.mkString(", ")
+            s"'$shortName', '$dotName', ftypes.$spec, {$entries}, base.DEC"
+          case None =>
+            s"'$shortName', '$dotName', ftypes.$spec"
+        }
         // FIXME: hack
-        importList.add(s"local $varName = ProtoField.new('$shortName', '$dotName', ftypes.$spec)")
+        importList.add(s"local $varName = ProtoField.new($protoFieldArgs)")
         importList.add(s"table.insert($protoName.fields, $varName)")
 
         // For enum fields self.<n> holds the enum-wrapped value, not a plain
