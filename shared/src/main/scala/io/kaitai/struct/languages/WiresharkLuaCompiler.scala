@@ -21,7 +21,6 @@ class WiresharkLuaCompiler(typeProvider: ClassTypeProvider, config: RuntimeConfi
     outHeader.puts("-- This file is compatible with Lua 5.3")
     outHeader.puts
 
-    //importList.add("package.prepend_path(\"plugins/kaitai_struct_lua_runtime\")")
     importList.add("local class = require(\"class\")")
     importList.add("require(\"tvbstream\")")
     importList.add("require(\"kaitaistruct\")")
@@ -41,9 +40,47 @@ class WiresharkLuaCompiler(typeProvider: ClassTypeProvider, config: RuntimeConfi
     out.puts("")
   }
 
+  // Reads `-x-wireshark:` from the root type's `meta:` block (see MetaSpec.raw)
+  // and emits the DissectorTable registration(s) it describes, e.g.:
+  //   -x-wireshark:
+  //     table: ethertype
+  //     pattern: 0x22f0
+  // or, for multiple registrations:
+  //   -x-wireshark:
+  //     - table: ethertype
+  //       pattern: 0x22f0
+  //     - table: udp.port
+  //       pattern: 11159
+  // typeProvider.topClass (not nowClass, which by this point in codegen no
+  // longer points at the root type) is the root ClassSpec, and .meta is a
+  // plain field on it - no further unwrapping needed.
   override def fileFooter(topClassName: String): Unit = {
-    //out.puts("local udp_port = DissectorTable.get(\"udp.port\")")
-    //out.puts(f"udp_port:add(11159, $protoName)")
+    typeProvider.topClass.meta.raw.get("-x-wireshark") match {
+      case Some(regs: List[_]) => regs.foreach(emitWiresharkRegistration)
+      case Some(reg: Map[_, _]) => emitWiresharkRegistration(reg)
+      case Some(_) | None => // absent, or a shape we don't recognize - nothing to register
+    }
+  }
+
+  private def emitWiresharkRegistration(regAny: Any): Unit = {
+    val reg = regAny match {
+      case m: Map[_, _] => m.asInstanceOf[Map[String, Any]]
+      case _ => return
+    }
+    val tableOpt = reg.get("table").collect { case s: String => s }
+    val patternOpt = reg.get("pattern")
+    (tableOpt, patternOpt) match {
+      case (Some(table), Some(pattern)) =>
+        val patternLua = pattern match {
+          case s: String => s"'$s'"
+          case n => n.toString
+        }
+        val varName = s"dt_${table.replaceAll("[^a-zA-Z0-9_]", "_")}"
+        out.puts(s"local $varName = DissectorTable.get('$table')")
+        out.puts(s"$varName:add($patternLua, $protoName)")
+      case _ =>
+        // malformed entry (missing table/pattern) - ignore rather than fail the build
+    }
   }
 
   override def classConstructorHeader(name: List[String], parentType: DataType, rootClassName: List[String], isHybrid: Boolean, params: List[ParamDefSpec]): Unit = {

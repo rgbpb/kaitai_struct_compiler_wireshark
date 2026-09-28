@@ -13,7 +13,13 @@ case class MetaSpec(
   forceDebug: Boolean,
   opaqueTypes: Option[Boolean],
   zeroCopySubstream: Option[Boolean],
-  imports: List[String]
+  imports: List[String],
+  // Vendor extension keys (any key starting with "-", e.g. "-x-wireshark"),
+  // kept as parsed YAML (String/Int/Double/Boolean/List[Any]/Map[String, Any])
+  // so language backends can read target-specific metadata. Legal per
+  // ParseUtils.ensureLegalKeys, but otherwise unused/unvalidated by the
+  // compiler itself.
+  raw: Map[String, Any] = Map()
 ) extends YAMLPath {
   def fillInDefaults(defSpec: MetaSpec): MetaSpec = {
     fillInEncoding(defSpec.encoding)
@@ -114,17 +120,8 @@ object MetaSpec {
 
     val imports = ParseUtils.getListStr(srcMap, "imports", path)
 
-    MetaSpec(
-      path,
-      isOpaque = false,
-      id,
-      endian,
-      bitEndian,
-      encoding,
-      forceDebug,
-      opaqueTypes,
-      zeroCopySubstream,
-      imports
-    )
+    val raw = srcMap.collect { case (k, v) if k.startsWith("-") => (k, v) }
+
+    MetaSpec(path, isOpaque = false, id, endian, bitEndian, encoding, forceDebug, opaqueTypes, zeroCopySubstream, imports, raw)
   }
 }
