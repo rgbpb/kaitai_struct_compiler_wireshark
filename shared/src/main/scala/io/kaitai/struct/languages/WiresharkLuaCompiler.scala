@@ -79,7 +79,15 @@ class WiresharkLuaCompiler(typeProvider: ClassTypeProvider, config: RuntimeConfi
         // was mis-reported as a 32-bit field regardless of its real size.
         val prefix = if (signed) "INT" else "UINT"
         s"$prefix${width.width * 8}"
-      case BitsType1(_) => "BOOLEAN"
+      case BitsType1(_) | CalcBooleanType => "BOOLEAN"
+      // Types of value instances (computed, not read from the stream).
+      // Enum-typed ones get 32 bits so Wireshark's valuestring lookup works
+      // (it doesn't apply to 64-bit fields); plain computed ints use 64 bits.
+      case EnumType(_, CalcIntType) => "INT32"
+      case CalcIntType => "INT64"
+      case CalcFloatType => "DOUBLE"
+      case CalcStrType => "STRING"
+      case CalcBytesType => "BYTES"
       case BitsType(width, _) =>
         // bucket by bit width into the smallest ftype that holds it, instead of
         // always falling back to BYTES (which made tree:add reject a plain number).
@@ -93,6 +101,105 @@ class WiresharkLuaCompiler(typeProvider: ClassTypeProvider, config: RuntimeConfi
       case EnumType(_, basedOn) => attr2wireshark(basedOn)
       case _ => "BYTES"
     }
+
+  // Lua numbers can't carry full 64-bit precision; Wireshark's tree:add
+  // needs its UInt64/Int64 userdata for ftypes.UINT64/INT64 values.
+  private def wrap64(spec: String, valueSrc: String): String = spec match {
+    case "UINT64" => s"UInt64($valueSrc)"
+    case "INT64" => s"Int64($valueSrc)"
+    case _ => valueSrc
+  }
+
+  // Builds the arguments of ProtoField.new(...), including the valuestring
+  // table (raw id -> symbolic name) for enum-typed fields.
+  private def protoFieldArgs(shortName: String, dotName: String, spec: String, attrType: DataType): String = {
+    val enumSpecOpt = attrType match {
+      case et: EnumType => et.enumSpec
+      case _ => None
+    }
+    enumSpecOpt match {
+      case Some(es) =>
+        val entries = es.sortedSeq.map { case (id, v) => s"[$id] = '${v.name}'" }.mkString(", ")
+        s"'$shortName', '$dotName', ftypes.$spec, {$entries}, base.DEC"
+      case None =>
+        s"'$shortName', '$dotName', ftypes.$spec"
+    }
+  }
+
+  // Endianness of the read method currently being emitted. Value instances
+  // are shown once, at the end of the plain `_read`, not in `_read_le/_be`.
+  private var curReadEndian: Option[FixedEndian] = None
+
+  override def readHeader(endian: Option[FixedEndian], isEmpty: Boolean): Unit = {
+    curReadEndian = endian
+    super.readHeader(endian, isEmpty)
+  }
+
+  // Value instances are lazy getters that nothing calls during dissection, so
+  // they never reached the packet tree. Evaluate them at the end of `_read` and
+  // add them as *generated* items (Wireshark renders those in [square brackets],
+  // like a computed IPv4 checksum). Each evaluation runs under pcall so an
+  // instance that can't be computed (nil operand, etc.) doesn't abort the dissector.
+  override def readFooter(): Unit = {
+    if (curReadEndian.isEmpty) {
+      typeProvider.nowClass.instances.foreach {
+        case (instName, vi: ValueInstanceSpec) => emitValueInstanceItem(instName, vi)
+        case _ => // parse instances are not evaluated eagerly
+      }
+    }
+    super.readFooter()
+  }
+
+  private def emitValueInstanceItem(instName: InstanceIdentifier, vi: ValueInstanceSpec): Unit =
+    vi.dataTypeOpt match {
+      case None => // type undecided, nothing sensible to display
+      case Some(_: UserType | _: SwitchType | _: ArrayType | CalcKaitaiStructType) =>
+        // objects/arrays have no single-value Wireshark representation
+      case Some(dataType) => emitValueInstanceField(instName, vi, dataType)
+    }
+
+  private def emitValueInstanceField(instName: InstanceIdentifier, vi: ValueInstanceSpec, dataType: DataType): Unit = {
+    // For `enum:` the parser wrapped the expression in EnumById; the tree needs
+    // the plain number (Wireshark applies the valuestring itself), so unwrap it.
+    val rawExpr = vi.value match {
+      case Ast.expr.EnumById(_, inner, _) => inner
+      case other => other
+    }
+    val spec = attr2wireshark(dataType)
+    val shortName = publicMemberName(instName)
+    val varName = protoFieldName(instName)
+    val dotName = typeProvider.nowClass.name.map(x => type2class(x)).mkString(".") + "." + shortName
+    importList.add(s"local $varName = ProtoField.new(${protoFieldArgs(shortName, dotName, spec, dataType)})")
+    importList.add(s"table.insert($protoName.fields, $varName)")
+
+    val valueLua = translator.translate(rawExpr)
+    out.puts("do")
+    out.inc
+    out.puts("local _ok, _val = pcall(function()")
+    out.inc
+    vi.ifExpr match {
+      case Some(cond) =>
+        out.puts(s"if ${translator.translate(cond)} then return $valueLua end")
+        out.puts("return nil")
+      case None =>
+        out.puts(s"return $valueLua")
+    }
+    out.dec
+    out.puts("end)")
+    out.puts("if _ok and _val ~= nil then")
+    out.inc
+    // No tvb range here on purpose: a value instance isn't backed by any actual
+    // bytes, and self._io:pos() can land exactly at the end of a byte-limited
+    // substream, which some TVBStream wrappers reject as "out of bounds" even
+    // for a zero-length range. tree:add(protofield, value) - value with no
+    // range - is the standard wslua idiom for a purely computed/generated item.
+    out.puts(s"local _item = self._tree:add($varName, ${wrap64(spec, "_val")})")
+    out.puts("_item:set_generated()")
+    out.dec
+    out.puts("end")
+    out.dec
+    out.puts("end")
+  }
 
   override def attrUserTypeParse(id: Identifier, dataType: UserType, io: String, rep: RepeatSpec, defEndian: Option[FixedEndian], assignType: DataType): Unit = {
     var tvbCalcSize = true
@@ -157,22 +264,8 @@ class WiresharkLuaCompiler(typeProvider: ClassTypeProvider, config: RuntimeConfi
         val shortName = idToStr(attrName)
         val dotName = typeProvider.nowClass.name.map(x => type2class(x)).mkString(".") + "." + publicMemberName(attrName)
 
-        // For enum fields, build a Wireshark "valuestring" table (raw id -> symbolic
-        // name) so the packet tree shows e.g. "(destination_unreachable) 3" instead of just "3". Enum
-        // member names are validated KS identifiers, so no quoting/escaping needed.
-        val enumSpecOpt = attrType match {
-          case et: EnumType => et.enumSpec
-          case _ => None
-        }
-        val protoFieldArgs = enumSpecOpt match {
-          case Some(es) =>
-            val entries = es.sortedSeq.map { case (id, v) => s"[$id] = '${v.name}'" }.mkString(", ")
-            s"'$shortName', '$dotName', ftypes.$spec, {$entries}, base.DEC"
-          case None =>
-            s"'$shortName', '$dotName', ftypes.$spec"
-        }
         // FIXME: hack
-        importList.add(s"local $varName = ProtoField.new($protoFieldArgs)")
+        importList.add(s"local $varName = ProtoField.new(${protoFieldArgs(shortName, dotName, spec, attrType)})")
         importList.add(s"table.insert($protoName.fields, $varName)")
 
         // For enum fields self.<n> holds the enum-wrapped value, not a plain
@@ -181,13 +274,7 @@ class WiresharkLuaCompiler(typeProvider: ClassTypeProvider, config: RuntimeConfi
           case EnumType(_, _) => s"_raw_${idToStr(attrName)}"
           case _ => privateMemberName(attrName)
         }
-        // Lua numbers can't carry full 64-bit precision; Wireshark's tree:add
-        // needs its UInt64/Int64 userdata for ftypes.UINT64/INT64 values.
-        val valueExpr = spec match {
-          case "UINT64" => s"UInt64($valueSrc)"
-          case "INT64" => s"Int64($valueSrc)"
-          case _ => valueSrc
-        }
+        val valueExpr = wrap64(spec, valueSrc)
         out.puts(s"self._tree:add($varName, $io._io.tvb(_offset, $io:pos() - _offset), $valueExpr)")
     }
   }
