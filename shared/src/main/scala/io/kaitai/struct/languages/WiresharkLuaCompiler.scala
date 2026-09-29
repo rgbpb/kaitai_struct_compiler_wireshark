@@ -281,7 +281,26 @@ class WiresharkLuaCompiler(typeProvider: ClassTypeProvider, config: RuntimeConfi
   // instead of the enum object.
   private var curEnumAttrId: Option[Identifier] = None
 
+  // ClassCompiler.compileAttrReaders calls attributeDoc for every seq attribute
+  // with a `doc:`, expecting it to sit right above the generated reader/getter.
+  // Lua's attributeReader is a no-op though, so that call landed in a totally
+  // separate pass from _read() - the comments ended up dumped in a disconnected
+  // block, detached from the code they describe. We suppress it here for seq
+  // attributes (NamedIdentifier/NumberedIdentifier/etc.) and instead emit the
+  // doc comment ourselves in attrDebugStart, right above the actual read.
+  // compileInstanceDoc reuses this same hook with an InstanceIdentifier though,
+  // and that placement (right above the property getter) is already correct,
+  // so we let it through unchanged.
+  override def attributeDoc(id: Identifier, doc: DocSpec): Unit = id match {
+    case _: InstanceIdentifier => super.attributeDoc(id, doc)
+    case _ => // emitted inline in _read() instead - see attrDebugStart
+  }
+
   override def attrDebugStart(attrId: Identifier, attrType: DataType, io: Option[String], rep: RepeatSpec): Unit = {
+    typeProvider.nowClass.seq.find(_.id == attrId).foreach { attr =>
+      if (!attr.doc.isEmpty) universalDoc(attr.doc)
+    }
+
     curEnumAttrId = attrType match {
       case EnumType(_, _) => Some(attrId)
       case _ => None
