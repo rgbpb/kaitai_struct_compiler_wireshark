@@ -1,7 +1,7 @@
 package io.kaitai.struct.languages
 
 import io.kaitai.struct.{ClassTypeProvider, RuntimeConfig, Utils}
-import io.kaitai.struct.datatype.{DataType, FixedEndian, InheritedEndian, KSError, ValidationNotEqualError, NeedRaw, LittleEndian, BigEndian}
+import io.kaitai.struct.datatype.{DataType, FixedEndian, InheritedEndian, KSError, ValidationNotEqualError, LittleEndian, BigEndian}
 import io.kaitai.struct.datatype.DataType._
 import io.kaitai.struct.exprlang.Ast
 import io.kaitai.struct.format._
@@ -120,7 +120,7 @@ class WiresharkLuaCompiler(typeProvider: ClassTypeProvider, config: RuntimeConfi
       // Types of value instances (computed, not read from the stream).
       // Enum-typed ones get 32 bits so Wireshark's valuestring lookup works
       // (it doesn't apply to 64-bit fields); plain computed ints use 64 bits.
-      case EnumType(_, CalcIntType) => "INT32"
+      case EnumType(_, _, CalcIntType) => "INT32"
       case CalcIntType => "INT64"
       case CalcFloatType => "DOUBLE"
       case CalcStrType => "STRING"
@@ -135,7 +135,7 @@ class WiresharkLuaCompiler(typeProvider: ClassTypeProvider, config: RuntimeConfi
       case FloatMultiType(width, _) =>
         if (width.width == 8) "DOUBLE" else "FLOAT"
       case _:StrType => "STRINGZ"
-      case EnumType(_, basedOn) => attr2wireshark(basedOn)
+      case EnumType(_, _, basedOn) => attr2wireshark(basedOn)
       case _ => "BYTES"
     }
 
@@ -156,7 +156,7 @@ class WiresharkLuaCompiler(typeProvider: ClassTypeProvider, config: RuntimeConfi
     }
     enumSpecOpt match {
       case Some(es) =>
-        val entries = es.sortedSeq.map { case (id, v) => s"[$id] = '${v.name}'" }.mkString(", ")
+        val entries = es.map.iterator.map { case (id, v) => s"[$id] = '${v.name}'" }.mkString(", ")
         s"'$shortName', '$dotName', ftypes.$spec, {$entries}, base.DEC"
       case None =>
         s"'$shortName', '$dotName', ftypes.$spec"
@@ -190,7 +190,7 @@ class WiresharkLuaCompiler(typeProvider: ClassTypeProvider, config: RuntimeConfi
   private def emitValueInstanceItem(instName: InstanceIdentifier, vi: ValueInstanceSpec): Unit =
     vi.dataTypeOpt match {
       case None => // type undecided, nothing sensible to display
-      case Some(_: UserType | _: SwitchType | _: ArrayType | CalcKaitaiStructType) =>
+      case Some(_: UserType | _: SwitchType | _: ArrayType | CalcKaitaiStructType(_)) =>
         // objects/arrays have no single-value Wireshark representation
       case Some(dataType) => emitValueInstanceField(instName, vi, dataType)
     }
@@ -251,10 +251,10 @@ class WiresharkLuaCompiler(typeProvider: ClassTypeProvider, config: RuntimeConfi
         // no fixed buffer, just use regular IO
         io
     }
-    val expr = parseExpr(dataType, dataType, newIO, defEndian)
+    val expr = parseExpr(dataType, newIO, defEndian)
     out.puts(s"local _tree = self._tree:add($tvb, '${idToStr(id)}')")
     // FIXME: ignores autoread
-    handleAssignment(id, expr, rep, false)
+    handleAssignment(id, expr, rep, false, dataType, dataType)
     if (tvbCalcSize) {
       out.puts(s"_tree:set_len($io:pos() - _offset)")
     }
@@ -302,7 +302,7 @@ class WiresharkLuaCompiler(typeProvider: ClassTypeProvider, config: RuntimeConfi
     }
 
     curEnumAttrId = attrType match {
-      case EnumType(_, _) => Some(attrId)
+      case EnumType(_, _, _) => Some(attrId)
       case _ => None
     }
     io match {
@@ -327,7 +327,7 @@ class WiresharkLuaCompiler(typeProvider: ClassTypeProvider, config: RuntimeConfi
         // For enum fields self.<n> holds the enum-wrapped value, not a plain
         // number - use the raw value stashed by parseExpr() instead.
         val valueSrc = attrType match {
-          case EnumType(_, _) => s"_raw_${idToStr(attrName)}"
+          case EnumType(_, _, _) => s"_raw_${idToStr(attrName)}"
           case _ => privateMemberName(attrName)
         }
         val valueExpr = wrap64(spec, valueSrc)
@@ -335,7 +335,7 @@ class WiresharkLuaCompiler(typeProvider: ClassTypeProvider, config: RuntimeConfi
     }
   }
 
-  override def parseExpr(dataType: DataType, assignType: DataType, io: String, defEndian: Option[FixedEndian]): String = {
+  override def parseExpr(dataType: DataType, io: String, defEndian: Option[FixedEndian]): String = {
     val raw = dataType match {
       case t: ReadableType =>
         s"$io:read_${t.apiCall(defEndian)}()"
