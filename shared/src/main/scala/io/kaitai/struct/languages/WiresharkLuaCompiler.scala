@@ -286,7 +286,12 @@ class WiresharkLuaCompiler(typeProvider: ClassTypeProvider, config: RuntimeConfi
     }
     val expr = parseExpr(dataType, newIO, defEndian)
     out.puts(s"local _tree = self._tree:add($tvb, '${idToStr(id)}')")
-    // FIXME: ignores autoread
+    // Only the `autoRead = true` path of the base attrUserTypeParse is supported:
+    // the constructor of the generated class calls _read() by itself, so a plain
+    // assignment is enough. With `autoRead = false` (--no-auto-read, --debug or
+    // `ks-debug: true`) the base class would additionally call userTypeDebugRead()
+    // here, but the generated dissector never calls obj:_read() on the top-level
+    // object either, so that mode can't work for this target anyway.
     handleAssignment(id, expr, rep, false, dataType, dataType)
     if (tvbCalcSize) {
       out.puts(s"_tree:set_len($io:pos() - _offset)")
