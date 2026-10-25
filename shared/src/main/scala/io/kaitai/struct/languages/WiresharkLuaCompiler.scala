@@ -296,9 +296,26 @@ class WiresharkLuaCompiler(typeProvider: ClassTypeProvider, config: RuntimeConfi
     case _ => // emitted inline in _read() instead - see attrDebugStart
   }
 
+  // The dissector can't work without the attribute positions that the
+  // attrDebugStart/attrDebugEnd hooks provide (they build the `_offset` locals
+  // and the tree:add(...) calls), so always request them instead of requiring
+  // the user to pass --read-pos. The base implementation only returns true when
+  // config.readStoresPos is set; we keep its identifier filter and drop that
+  // condition. Note this deliberately does NOT touch config.autoRead, so the
+  // constructor still runs _read() on its own (--debug would disable that).
+  override def attrDebugNeeded(attrId: Identifier): Boolean = attrId match {
+    case _: NamedIdentifier | _: NumberedIdentifier | _: InstanceIdentifier => true
+    case _ => false
+  }
+
   override def attrDebugStart(attrId: Identifier, attrType: DataType, io: Option[String], rep: RepeatSpec): Unit = {
-    typeProvider.nowClass.seq.find(_.id == attrId).foreach { attr =>
-      if (!attr.doc.isEmpty) universalDoc(attr.doc)
+    // For `repeat:` attributes CommonReads calls this twice: once before the loop
+    // (rep == NoRepeat) and once per element inside it (rep == the real repeat spec).
+    // Only the first call gets the doc comment, so it appears once, above the loop.
+    if (rep == NoRepeat) {
+      typeProvider.nowClass.seq.find(_.id == attrId).foreach { attr =>
+        if (!attr.doc.isEmpty) universalDoc(attr.doc)
+      }
     }
 
     curEnumAttrId = attrType match {
