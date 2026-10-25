@@ -28,6 +28,10 @@ class WiresharkLuaCompiler(typeProvider: ClassTypeProvider, config: RuntimeConfi
     val className = type2class(topClassName)
     importList.add(s"local $protoName = Proto('$topClassName', '$className')")
     importList.add(s"$protoName.fields = {}")
+    // All ProtoFields live in this one table (see registerProtoField), instead of
+    // one Lua `local` each: a function may only have ~200 locals / 255 upvalues,
+    // which a large spec would exceed.
+    importList.add(s"local $fieldsTable = {}")
     out.puts
     out.puts(s"function ${protoName}.dissector(tvb, pinfo, root)")
     out.inc
@@ -55,6 +59,7 @@ class WiresharkLuaCompiler(typeProvider: ClassTypeProvider, config: RuntimeConfi
   // longer points at the root type) is the root ClassSpec, and .meta is a
   // plain field on it - no further unwrapping needed.
   override def fileFooter(topClassName: String): Unit = {
+    emitProtoFieldDeclarations()
     typeProvider.topClass.meta.raw.get("-x-wireshark") match {
       case Some(regs: List[_]) => regs.foreach(emitWiresharkRegistration)
       case Some(reg: Map[_, _]) => emitWiresharkRegistration(reg)
@@ -147,6 +152,36 @@ class WiresharkLuaCompiler(typeProvider: ClassTypeProvider, config: RuntimeConfi
     case _ => valueSrc
   }
 
+  // Name of the Lua table holding every ProtoField of the generated dissector.
+  def fieldsTable: String = "pf"
+
+  // ProtoField declarations collected while the parser code is generated:
+  // table key -> arguments of ProtoField.new(...), in first-use order. They are
+  // printed once, by fileFooter. The generated _read() code only refers to them
+  // as `pf.<key>` at run time, so it doesn't matter that they are declared after it.
+  private val protoFieldDecls = scala.collection.mutable.LinkedHashMap[String, String]()
+
+  // Registers a field and returns the Lua expression referring to it. Asking for
+  // the same field again (e.g. a repeated attribute is visited twice) returns the
+  // same entry; a different field that maps to an already used key gets a numeric
+  // suffix instead of silently replacing the first one.
+  private def registerProtoField(baseKey: String, args: String): String = {
+    var key = baseKey
+    var n = 1
+    while (protoFieldDecls.get(key).exists(_ != args)) {
+      n += 1
+      key = s"${baseKey}_$n"
+    }
+    protoFieldDecls.getOrElseUpdate(key, args)
+    s"$fieldsTable.$key"
+  }
+
+  private def emitProtoFieldDeclarations(): Unit =
+    protoFieldDecls.foreach { case (key, args) =>
+      out.puts(s"$fieldsTable.$key = ProtoField.new($args)")
+      out.puts(s"table.insert($protoName.fields, $fieldsTable.$key)")
+    }
+
   // Builds the arguments of ProtoField.new(...), including the valuestring
   // table (raw id -> symbolic name) for enum-typed fields.
   private def protoFieldArgs(shortName: String, dotName: String, spec: String, attrType: DataType): String = {
@@ -204,10 +239,8 @@ class WiresharkLuaCompiler(typeProvider: ClassTypeProvider, config: RuntimeConfi
     }
     val spec = attr2wireshark(dataType)
     val shortName = publicMemberName(instName)
-    val varName = protoFieldName(instName)
     val dotName = typeProvider.nowClass.name.map(x => type2class(x)).mkString(".") + "." + shortName
-    importList.add(s"local $varName = ProtoField.new(${protoFieldArgs(shortName, dotName, spec, dataType)})")
-    importList.add(s"table.insert($protoName.fields, $varName)")
+    val fieldRef = registerProtoField(protoFieldName(instName), protoFieldArgs(shortName, dotName, spec, dataType))
 
     val valueLua = translator.translate(rawExpr)
     out.puts("do")
@@ -230,7 +263,7 @@ class WiresharkLuaCompiler(typeProvider: ClassTypeProvider, config: RuntimeConfi
     // substream, which some TVBStream wrappers reject as "out of bounds" even
     // for a zero-length range. tree:add(protofield, value) - value with no
     // range - is the standard wslua idiom for a purely computed/generated item.
-    out.puts(s"local _item = self._tree:add($varName, ${wrap64(spec, "_val")})")
+    out.puts(s"local _item = self._tree:add($fieldRef, ${wrap64(spec, "_val")})")
     out.puts("_item:set_generated()")
     out.dec
     out.puts("end")
@@ -333,13 +366,9 @@ class WiresharkLuaCompiler(typeProvider: ClassTypeProvider, config: RuntimeConfi
       case _:UserType | _:SwitchType | _:ArrayType => {}
       case _ =>
         val spec = attr2wireshark(attrType)
-        val varName = protoFieldName(attrName)
         val shortName = idToStr(attrName)
         val dotName = typeProvider.nowClass.name.map(x => type2class(x)).mkString(".") + "." + publicMemberName(attrName)
-
-        // FIXME: hack
-        importList.add(s"local $varName = ProtoField.new(${protoFieldArgs(shortName, dotName, spec, attrType)})")
-        importList.add(s"table.insert($protoName.fields, $varName)")
+        val fieldRef = registerProtoField(protoFieldName(attrName), protoFieldArgs(shortName, dotName, spec, attrType))
 
         // For enum fields self.<n> holds the enum-wrapped value, not a plain
         // number - use the raw value stashed by parseExpr() instead.
@@ -348,7 +377,7 @@ class WiresharkLuaCompiler(typeProvider: ClassTypeProvider, config: RuntimeConfi
           case _ => privateMemberName(attrName)
         }
         val valueExpr = wrap64(spec, valueSrc)
-        out.puts(s"self._tree:add($varName, $io._io.tvb(_offset, $io:pos() - _offset), $valueExpr)")
+        out.puts(s"self._tree:add($fieldRef, $io._io.tvb(_offset, $io:pos() - _offset), $valueExpr)")
     }
   }
 
